@@ -813,7 +813,7 @@ class FastWatermarkApp:
             if known:
                 best_tag, best_entry = known[0]
                 best_count = best_entry.get("count", 0)
-                if best_count >= 2:
+                if best_count >= 1:
                     second_count = known[1][1].get("count", 0) if len(known) > 1 else 0
                     if best_count >= second_count * 2:
                         auto_select.add(best_tag.lower())
