@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import gc
 import random
 import struct
 import threading
@@ -955,7 +956,26 @@ class FastWatermarkApp:
         self.root.after(0, lambda: self.progress.configure(maximum=total_files, value=0))
 
         processed = 0
-        max_workers = min(os.cpu_count() or 4, 8)  # I/O-bound, 4-8 threads ideal
+        # ── Determine worker count based on image resolution ──
+        # 4K + post-processing = memory bomb; scale workers down aggressively
+        pp_enabled = cfg["pp_cfg"]["enabled"]
+        max_dim = 0
+        for fp in files:
+            try:
+                with Image.open(fp) as probe:
+                    max_dim = max(max_dim, *probe.size)
+            except Exception:
+                pass
+
+        cpu_count = os.cpu_count() or 4
+        if pp_enabled and max_dim > 3000:
+            max_workers = 1  # 4K+ with PP: serial only
+        elif pp_enabled and max_dim > 2000:
+            max_workers = min(cpu_count, 2)  # 2K+ with PP: 2 max
+        elif max_dim > 3000:
+            max_workers = min(cpu_count, 3)  # 4K without PP
+        else:
+            max_workers = min(cpu_count, 8)
 
         # Pre-create output dirs to avoid race conditions
         for file_path in files:
@@ -1125,14 +1145,15 @@ class FastWatermarkApp:
         """Thread-safe image watermarking. Reads all params from cfg dict."""
         with Image.open(image_path) as im:
             pp_cfg = cfg["pp_cfg"]
-            if pp_cfg["enabled"]:
-                if im.mode not in ("RGB", "RGBA"):
-                    im_proc = im.convert("RGB")
-                else:
-                    im_proc = im.copy()
-                im_proc = apply_pipeline(im_proc, pp_cfg)
+
+            # ── Get image in workable format (avoid unnecessary copies) ──
+            if im.mode not in ("RGB", "RGBA"):
+                im_proc = im.convert("RGB")
             else:
-                im_proc = im.copy()
+                im_proc = im  # no copy — apply_pipeline creates new images
+
+            if pp_cfg["enabled"]:
+                im_proc = apply_pipeline(im_proc, pp_cfg)
 
             im_width, im_height = im_proc.size
             wm_width, wm_height = watermark.size
@@ -1169,6 +1190,11 @@ class FastWatermarkApp:
             layer.paste(wm_resized, position, wm_resized)
             result = Image.alpha_composite(base, layer)
 
+            # ── Release intermediates immediately ──
+            del im_proc, base, layer, wm_resized
+            if pp_cfg["enabled"]:
+                gc.collect()  # force cleanup of large numpy arrays from PP pipeline
+
             filename = self._build_output_filename(image_path, counters_lock)
             ext = os.path.splitext(filename)[1].lower()
             save_path = os.path.join(save_folder, filename)
@@ -1187,6 +1213,9 @@ class FastWatermarkApp:
                 rgb.save(save_path, "JPEG", quality=95, optimize=True)
             else:
                 result.save(save_path, "PNG", optimize=True)
+
+            del result
+            gc.collect()
 
 if __name__ == "__main__":
     root = TkinterDnD.Tk()
